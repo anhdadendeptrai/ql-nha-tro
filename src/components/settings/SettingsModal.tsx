@@ -83,7 +83,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
 
     const newToa: ToaNha = {
-      id: `toa-${Date.now()}`,
+      id: crypto.randomUUID(),
       owner_id: ownerId,
       ten: trimmed,
       dia_chi: '',
@@ -135,7 +135,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         updated_at: new Date().toISOString(),
       };
 
-      await db.cai_dat.put(updatedCaiDat);
+      await SyncService.saveCaiDat(updatedCaiDat);
 
       // Lưu đơn giá và thông tin các tòa
       for (const toa of toas) {
@@ -144,8 +144,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
       showToast('Đã lưu cấu hình cài đặt và VietQR!', 'success');
       onClose();
-    } catch {
-      showToast('Lỗi khi lưu cài đặt.', 'error');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Lỗi khi lưu cài đặt.', 'error');
     } finally {
       setIsSubmitting(false);
     }
@@ -157,7 +157,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         'Bạn có chắc chắn muốn đăng xuất? Toàn bộ dữ liệu đệm trên máy này sẽ bị xóa để đảm bảo an toàn.'
       )
     ) {
-      await logout();
+      const res = await logout();
+      if (!res.success) {
+        alert(res.error || 'Không thể đăng xuất vì còn dữ liệu chưa đồng bộ!');
+        return;
+      }
       showToast('Đã đăng xuất và xóa dữ liệu đệm an toàn.', 'info');
       onClose();
     }

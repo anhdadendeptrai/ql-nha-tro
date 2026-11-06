@@ -135,7 +135,7 @@ export const AddStudentModal: React.FC<AddStudentModalProps> = ({
     try {
       setIsSubmitting(true);
       const studentData: SinhVien = {
-        id: existingStudent?.id || `sv-${Date.now()}`,
+        id: existingStudent?.id || crypto.randomUUID(),
         owner_id: ownerId,
         hop_dong_id: hopDongId,
         ho_ten: cleanHoTen,

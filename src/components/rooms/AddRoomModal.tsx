@@ -33,7 +33,7 @@ export const AddRoomModal: React.FC<AddRoomModalProps> = ({
 
     setIsSubmitting(true);
     const newRoom: Phong = {
-      id: `p-${Date.now()}`,
+      id: crypto.randomUUID(),
       owner_id: ownerId,
       toa_id: toaId,
       so_phong: soPhong.trim(),

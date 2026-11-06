@@ -12,7 +12,7 @@ interface AuthContextType {
   isConfigured: boolean;
   isLoading: boolean;
   login: (email: string, pass: string) => Promise<{ success: boolean; error?: string }>;
-  logout: () => Promise<void>;
+  logout: () => Promise<{ success: boolean; error?: string }>;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
@@ -46,45 +46,49 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const initAuth = async () => {
       setIsLoading(true);
 
-      if (configured) {
-        // Kiểm tra phiên đăng nhập hiện tại từ Supabase
-        const { data } = await supabase.auth.getSession();
-        if (data.session?.user) {
-          setUser(data.session.user);
-          SyncService.syncFromSupabase(data.session.user.id);
-        }
-
-        // Lắng nghe thay đổi trạng thái Auth
-        const { data: authListener } = supabase.auth.onAuthStateChange(async (_event, session) => {
-          if (session?.user) {
-            setUser(session.user);
-            SyncService.syncFromSupabase(session.user.id);
-          } else {
-            setUser(null);
+      try {
+        if (configured) {
+          // Kiểm tra phiên đăng nhập hiện tại từ Supabase
+          const { data } = await supabase.auth.getSession();
+          if (data.session?.user) {
+            setUser(data.session.user);
+            // Tải dữ liệu về Dexie trước khi mở giao diện
+            await SyncService.syncFromSupabase(data.session.user.id);
           }
-        });
 
-        unsubscribe = () => {
-          authListener.subscription.unsubscribe();
-        };
-      } else {
-        // Supabase chưa cấu hình -> Kiểm tra phiên Dev Mock nếu bật
-        if (import.meta.env.DEV) {
-          if (devMockEnabled && localStorage.getItem('qlpt_mock_session') === 'true') {
-            const mockUser = {
-              id: DEV_MOCK_OWNER_ID,
-              email: devEmail,
-              aud: 'authenticated',
-              app_metadata: {},
-              user_metadata: {},
-              created_at: new Date().toISOString(),
-            } as unknown as User;
-            setUser(mockUser);
+          // Lắng nghe thay đổi trạng thái Auth
+          const { data: authListener } = supabase.auth.onAuthStateChange(async (event, session) => {
+            if (event === 'SIGNED_IN' && session?.user) {
+              setUser(session.user);
+            } else if (event === 'SIGNED_OUT') {
+              setUser(null);
+            }
+          });
+
+          unsubscribe = () => {
+            authListener.subscription.unsubscribe();
+          };
+        } else {
+          // Supabase chưa cấu hình -> Kiểm tra phiên Dev Mock nếu bật
+          if (import.meta.env.DEV) {
+            if (devMockEnabled && localStorage.getItem('qlpt_mock_session') === 'true') {
+              const mockUser = {
+                id: DEV_MOCK_OWNER_ID,
+                email: devEmail,
+                aud: 'authenticated',
+                app_metadata: {},
+                user_metadata: {},
+                created_at: new Date().toISOString(),
+              } as unknown as User;
+              setUser(mockUser);
+            }
           }
         }
+      } catch (err) {
+        console.error('Lỗi khởi tạo phiên đăng nhập:', err);
+      } finally {
+        setIsLoading(false);
       }
-
-      setIsLoading(false);
     };
 
     initAuth();
@@ -112,7 +116,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
         if (data.user) {
           setUser(data.user);
-          await SyncService.syncFromSupabase(data.user.id);
+          setIsLoading(true);
+          try {
+            await SyncService.syncFromSupabase(data.user.id);
+          } finally {
+            setIsLoading(false);
+          }
         }
         return { success: true };
       } catch (err: unknown) {
@@ -159,7 +168,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   };
 
-  const logout = async () => {
+  const logout = async (): Promise<{ success: boolean; error?: string }> => {
+    // 1. CHẶN đăng xuất nếu còn thay đổi trong outbox chưa đẩy lên máy chủ
+    try {
+      const pendingCount = await db.outbox.count();
+      if (pendingCount > 0) {
+        return {
+          success: false,
+          error: `Còn ${pendingCount} thay đổi chưa lưu lên máy chủ, vui lòng chờ hoặc kết nối mạng để hoàn tất đồng bộ!`,
+        };
+      }
+    } catch (checkErr) {
+      console.warn('Lỗi kiểm tra outbox:', checkErr);
+    }
+
     if (configured) {
       try {
         await supabase.auth.signOut();
@@ -172,7 +194,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     localStorage.removeItem('qlpt_mock_session');
     localStorage.removeItem('qlpt_last_synced_at');
 
-    // Xóa sạch toàn bộ dữ liệu đệm trong IndexedDB trên thiết bị
+    // Chỉ xóa sạch IndexedDB sau khi chắc chắn outbox rỗng
     try {
       await Promise.all([
         db.toa_nha.clear(),
@@ -184,10 +206,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         db.thanh_toan.clear(),
         db.chi_phi.clear(),
         db.cai_dat.clear(),
+        db.outbox.clear(),
       ]);
     } catch (err) {
       console.error('Lỗi xóa cache IndexedDB khi đăng xuất:', err);
     }
+
+    return { success: true };
   };
 
   const ownerId = user?.id || '';

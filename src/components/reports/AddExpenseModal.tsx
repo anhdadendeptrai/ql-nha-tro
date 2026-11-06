@@ -35,7 +35,7 @@ export const AddExpenseModal: React.FC<AddExpenseModalProps> = ({
 
     setIsSubmitting(true);
     const newExpense: ChiPhi = {
-      id: `cp-${Date.now()}`,
+      id: crypto.randomUUID(),
       owner_id: ownerId,
       toa_id: toaId,
       ngay,

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { X, Download, Upload, FileSpreadsheet, Database, Loader2 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { db } from '../../db/dexie';
+import { SyncService } from '../../db/sync';
 import { useToast } from '../common/Toast';
 import { isSupabaseConfigured, supabase } from '../../services/supabase';
 import type { ToaNha, HoaDon } from '../../types';
@@ -196,13 +197,34 @@ export const BackupModal: React.FC<BackupModalProps> = ({ onClose }) => {
       // Đẩy lên Supabase nếu có kết nối
       if (isSupabaseConfigured() && navigator.onLine) {
         try {
-          if (normalizedToas.length) await supabase.from('toa_nha').upsert(normalizedToas);
-          if (parsed.phong?.length) await supabase.from('phong').upsert(parsed.phong);
-          if (parsed.hop_dong?.length) await supabase.from('hop_dong').upsert(parsed.hop_dong);
-          if (parsed.sinh_vien?.length) await supabase.from('sinh_vien').upsert(parsed.sinh_vien);
-          if (parsed.chi_so?.length) await supabase.from('chi_so').upsert(parsed.chi_so);
-          if (normalizedHoaDons.length) await supabase.from('hoa_don').upsert(normalizedHoaDons);
-          if (parsed.chi_phi?.length) await supabase.from('chi_phi').upsert(parsed.chi_phi);
+          if (normalizedToas.length) {
+            const sanitized = normalizedToas.map((t) => SyncService.sanitizePayload('toa_nha', t as unknown as Record<string, unknown>));
+            await supabase.from('toa_nha').upsert(sanitized);
+          }
+          if (parsed.phong?.length) {
+            const sanitized = parsed.phong.map((p: any) => SyncService.sanitizePayload('phong', p as Record<string, unknown>));
+            await supabase.from('phong').upsert(sanitized);
+          }
+          if (parsed.hop_dong?.length) {
+            const sanitized = parsed.hop_dong.map((h: any) => SyncService.sanitizePayload('hop_dong', h as Record<string, unknown>));
+            await supabase.from('hop_dong').upsert(sanitized);
+          }
+          if (parsed.sinh_vien?.length) {
+            const sanitized = parsed.sinh_vien.map((s: any) => SyncService.sanitizePayload('sinh_vien', s as Record<string, unknown>));
+            await supabase.from('sinh_vien').upsert(sanitized);
+          }
+          if (parsed.chi_so?.length) {
+            const sanitized = parsed.chi_so.map((c: any) => SyncService.sanitizePayload('chi_so', c as Record<string, unknown>));
+            await supabase.from('chi_so').upsert(sanitized);
+          }
+          if (normalizedHoaDons.length) {
+            const sanitized = normalizedHoaDons.map((h: any) => SyncService.sanitizePayload('hoa_don', h as Record<string, unknown>));
+            await supabase.from('hoa_don').upsert(sanitized);
+          }
+          if (parsed.chi_phi?.length) {
+            const sanitized = parsed.chi_phi.map((c: any) => SyncService.sanitizePayload('chi_phi', c as Record<string, unknown>));
+            await supabase.from('chi_phi').upsert(sanitized);
+          }
         } catch (err) {
           console.error('Lỗi đồng bộ file khôi phục lên Supabase:', err);
         }

@@ -196,3 +196,30 @@ export interface PhongChiTiet extends Phong {
   da_het_han?: boolean;
   so_ngay_trong?: number; // Số ngày phòng bị bỏ trống
 }
+
+// Bảng hàng đợi đồng bộ ngoại tuyến (Outbox Pattern)
+export type OutboxAction = 'upsert' | 'delete';
+export type OutboxTable =
+  | 'toa_nha'
+  | 'phong'
+  | 'hop_dong'
+  | 'sinh_vien'
+  | 'chi_so'
+  | 'hoa_don'
+  | 'thanh_toan'
+  | 'chi_phi'
+  | 'cai_dat';
+
+export interface OutboxItem {
+  id: string; // UUID của hàng đợi
+  table_name: OutboxTable;
+  action: OutboxAction;
+  record_id: string;
+  payload: any;
+  created_at: string;
+  retry_count: number;
+  last_error?: string;
+}
+
+export type SyncState = 'synced' | 'syncing' | 'pending' | 'offline';
+

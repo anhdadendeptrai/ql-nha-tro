@@ -1,7 +1,9 @@
-import React, { useState } from 'react';
-import { Building2, RefreshCw, LogOut, Settings as SettingsIcon } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Building2, RefreshCw, LogOut, Settings as SettingsIcon, CloudCheck, CloudUpload, CloudOff } from 'lucide-react';
+import { useLiveQuery } from 'dexie-react-hooks';
 import { useAuth } from '../../context/AuthContext';
 import { SyncService } from '../../db/sync';
+import { db } from '../../db/dexie';
 import { useToast } from './Toast';
 
 interface NavbarProps {
@@ -12,6 +14,20 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenSettings }) => {
   const { user, ownerId, logout } = useAuth();
   const { showToast } = useToast();
   const [isSyncing, setIsSyncing] = useState(false);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+
+  const outboxCount = useLiveQuery(() => db.outbox.count(), []) ?? 0;
+
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
 
   const handleSync = async () => {
     if (!ownerId) return;
@@ -27,7 +43,11 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenSettings }) => {
 
   const handleLogout = async () => {
     if (window.confirm('Bạn có chắc chắn muốn đăng xuất? Dữ liệu lưu đệm trên máy sẽ được xóa để đảm bảo an toàn.')) {
-      await logout();
+      const res = await logout();
+      if (!res.success) {
+        alert(res.error || 'Không thể đăng xuất vì còn dữ liệu chưa lưu!');
+        return;
+      }
       showToast('Đã đăng xuất an toàn.', 'info');
     }
   };
@@ -44,10 +64,37 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenSettings }) => {
             <h1 className="font-bold text-slate-900 text-base leading-tight">
               QL Nhà Trọ Sinh Viên
             </h1>
-            <div className="flex items-center gap-1.5 text-xs text-slate-500">
-              <span className="text-emerald-600 font-medium truncate max-w-[180px]">
+            <div className="flex items-center gap-2 text-xs text-slate-500">
+              <span className="text-slate-600 font-medium truncate max-w-[130px] sm:max-w-[180px]">
                 {user?.email || 'Chủ trọ'}
               </span>
+
+              {/* Huy hiệu trạng thái đồng bộ */}
+              {!isOnline ? (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[11px] font-semibold">
+                  <CloudOff className="w-3 h-3 text-slate-500" />
+                  Ngoại tuyến {outboxCount > 0 ? `(${outboxCount})` : ''}
+                </span>
+              ) : isSyncing ? (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 text-[11px] font-semibold animate-pulse">
+                  <RefreshCw className="w-3 h-3 animate-spin text-blue-600" />
+                  Đang đồng bộ...
+                </span>
+              ) : outboxCount > 0 ? (
+                <span
+                  onClick={() => SyncService.processOutbox()}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 text-[11px] font-bold cursor-pointer hover:bg-amber-100 border border-amber-200"
+                  title="Bấm để thử đồng bộ ngay"
+                >
+                  <CloudUpload className="w-3 h-3 text-amber-600 animate-bounce" />
+                  {outboxCount} chưa lưu lên máy chủ
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-semibold">
+                  <CloudCheck className="w-3 h-3 text-emerald-600" />
+                  Đã đồng bộ
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -61,7 +108,7 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenSettings }) => {
             className={`p-2.5 rounded-xl text-slate-600 hover:text-blue-600 hover:bg-slate-100 transition-colors cursor-pointer ${
               isSyncing ? 'animate-spin text-blue-600' : ''
             }`}
-            title="Đồng bộ dữ liệu máy chủ"
+            title="Đồng bộ lại từ máy chủ"
             aria-label="Đồng bộ dữ liệu"
           >
             <RefreshCw className="w-5 h-5" />
@@ -81,7 +128,7 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenSettings }) => {
           <button
             onClick={handleLogout}
             className="p-2.5 rounded-xl text-slate-600 hover:text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
-            title="Đăng xuất"
+            title="Đăng xuất an toàn"
             aria-label="Đăng xuất"
           >
             <LogOut className="w-5 h-5" />

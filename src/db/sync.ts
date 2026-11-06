@@ -1,6 +1,10 @@
 /**
  * Quản lý đồng bộ dữ liệu giữa IndexedDB (Dexie) và Supabase (PostgreSQL)
- * Tuân thủ nguyên tắc: Hiển thị ngay từ Dexie -> Đồng bộ nền từ Supabase
+ * Tuân thủ nguyên tắc:
+ * 1. Supabase là NGUỒN DỮ LIỆU THẬT (Single Source of Truth), IndexedDB là bản đệm (Cache)
+ * 2. Optimistic UI: Ghi Dexie trước -> Đẩy Supabase sau. Nếu lỗi CSDL thì rollback Dexie và báo lỗi rõ ràng.
+ * 3. Ngoại tuyến (Offline): Hàng đợi Outbox lưu lại thay đổi, tự động đẩy lên Supabase khi có mạng.
+ * 4. Tất cả khóa chính phải là chuẩn UUID (crypto.randomUUID()) để tương thích kiểu UUID PostgreSQL.
  */
 
 import { db } from './dexie';
@@ -15,200 +19,544 @@ import type {
   ThanhToan,
   ChiPhi,
   CaiDat,
+  OutboxItem,
+  OutboxTable,
 } from '../types';
+
+type SyncListener = () => void;
 
 export class SyncService {
   private static lastSyncKey = 'qlpt_last_synced_at';
+  private static listeners: Set<SyncListener> = new Set();
+  private static isProcessingOutbox = false;
+
+  static subscribe(fn: SyncListener): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  private static notifyListeners(): void {
+    this.listeners.forEach((fn) => {
+      try {
+        fn();
+      } catch (e) {
+        console.error('Lỗi sync listener:', e);
+      }
+    });
+  }
 
   /**
-   * Đồng bộ toàn bộ dữ liệu từ Supabase về Dexie
+   * Kiểm tra lỗi có phải do mất mạng / ngoại tuyến không
+   */
+  static isNetworkError(err: unknown): boolean {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return true;
+    if (!err) return false;
+    const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+    return (
+      msg.includes('network') ||
+      msg.includes('failed to fetch') ||
+      msg.includes('fetch failed') ||
+      msg.includes('load failed') ||
+      msg.includes('connection refused') ||
+      msg.includes('timeout') ||
+      msg.includes('offline')
+    );
+  }
+
+  /**
+   * Lọc payload chỉ gồm các cột hợp lệ trong migration CSDL Supabase
+   */
+  static sanitizePayload(tableName: OutboxTable, data: Record<string, unknown>): Record<string, unknown> {
+    const allowedColumns: Record<OutboxTable, string[]> = {
+      toa_nha: [
+        'id', 'owner_id', 'ten', 'dia_chi', 'don_gia_dien', 'phi_dich_vu_dau_nguoi',
+        'ngay_chot_so', 'han_dong_tien', 'is_deleted', 'cach_tinh_nuoc', 'don_gia_nuoc',
+        'tien_rac', 'tien_mang', 'phi_gui_xe', 'created_at', 'updated_at'
+      ],
+      phong: [
+        'id', 'owner_id', 'toa_id', 'so_phong', 'tang', 'gia_thue', 'trang_thai',
+        'so_nguoi_toi_da', 'ghi_chu', 'ngay_trong_tu', 'is_deleted', 'created_at', 'updated_at'
+      ],
+      hop_dong: [
+        'id', 'owner_id', 'phong_id', 'ngay_bat_dau', 'ngay_het_han', 'tien_coc',
+        'gia_thue_thoa_thuan', 'do_ban_giao', 'nguoi_dai_dien_id', 'dang_hieu_luc',
+        'ghi_chu', 'created_at', 'updated_at'
+      ],
+      sinh_vien: [
+        'id', 'owner_id', 'hop_dong_id', 'ho_ten', 'sdt', 'cccd', 'truong', 'bien_so',
+        'anh_cccd_truoc', 'anh_cccd_sau', 'la_dai_dien', 'ngay_vao', 'dang_o',
+        'created_at', 'updated_at'
+      ],
+      chi_so: [
+        'id', 'owner_id', 'phong_id', 'thang', 'dien_dau', 'dien_cuoi', 'nuoc_dau',
+        'nuoc_cuoi', 'created_at', 'updated_at'
+      ],
+      hoa_don: [
+        'id', 'owner_id', 'phong_id', 'thang', 'tien_phong', 'tien_dien', 'tien_nuoc',
+        'tien_rac', 'tien_mang', 'tien_xe', 'tien_dich_vu', 'phi_dich_vu_dau_nguoi',
+        'phu_phi', 'tong_tien', 'da_dong', 'con_no', 'trang_thai', 'ghi_chu',
+        'don_gia_dien', 'don_gia_nuoc', 'cach_tinh_nuoc', 'so_dien', 'so_nuoc',
+        'so_nguoi', 'so_xe', 'created_at', 'updated_at'
+      ],
+      thanh_toan: [
+        'id', 'owner_id', 'hoa_don_id', 'ngay', 'so_tien', 'hinh_thuc', 'ghi_chu', 'created_at'
+      ],
+      chi_phi: [
+        'id', 'owner_id', 'toa_id', 'ngay', 'loai', 'so_tien', 'ghi_chu', 'created_at', 'updated_at'
+      ],
+      cai_dat: [
+        'owner_id', 'bank_id', 'so_tk', 'ten_chu_tk', 'nguong_canh_bao_dien',
+        'mau_tin_nhan', 'mau_hop_dong', 'created_at', 'updated_at'
+      ],
+    };
+
+    const allowed = allowedColumns[tableName];
+    if (!allowed) return { ...data };
+
+    const sanitized: Record<string, unknown> = {};
+    for (const key of allowed) {
+      if (data[key] !== undefined) {
+        sanitized[key] = data[key];
+      }
+    }
+    return sanitized;
+  }
+
+  /**
+   * Thêm một thao tác vào hàng đợi Outbox khi ngoại tuyến hoặc lỗi mạng tạm thời
+   */
+  static async addToOutbox(
+    tableName: OutboxTable,
+    action: 'upsert' | 'delete',
+    recordId: string,
+    payload: unknown
+  ): Promise<void> {
+    const item: OutboxItem = {
+      id: crypto.randomUUID(),
+      table_name: tableName,
+      action,
+      record_id: recordId,
+      payload,
+      created_at: new Date().toISOString(),
+      retry_count: 0,
+    };
+    await db.outbox.put(item);
+    this.notifyListeners();
+  }
+
+  /**
+   * Xử lý gửi toàn bộ hàng đợi outbox lên Supabase khi có mạng
+   */
+  static async processOutbox(): Promise<{ processed: number; remaining: number }> {
+    if (!isSupabaseConfigured() || !navigator.onLine || this.isProcessingOutbox) {
+      const remaining = await db.outbox.count();
+      return { processed: 0, remaining };
+    }
+
+    this.isProcessingOutbox = true;
+    let processed = 0;
+
+    try {
+      const items = await db.outbox.orderBy('created_at').toArray();
+      for (const item of items) {
+        try {
+          if (item.action === 'upsert') {
+            const sanitized = this.sanitizePayload(item.table_name, item.payload as Record<string, unknown>);
+            const { error } = await supabase.from(item.table_name).upsert(sanitized);
+            if (error) {
+              if (this.isNetworkError(error)) {
+                break; // Mất mạng, dừng lại chờ lần sau
+              }
+              console.error(`Lỗi đẩy outbox (${item.table_name}):`, error);
+              await db.outbox.update(item.id, {
+                retry_count: (item.retry_count || 0) + 1,
+                last_error: error.message,
+              });
+              continue;
+            }
+          } else if (item.action === 'delete') {
+            const { error } = await supabase.from(item.table_name).delete().eq('id', item.record_id);
+            if (error) {
+              if (this.isNetworkError(error)) break;
+              console.error(`Lỗi xóa outbox (${item.table_name}):`, error);
+              await db.outbox.update(item.id, {
+                retry_count: (item.retry_count || 0) + 1,
+                last_error: error.message,
+              });
+              continue;
+            }
+          }
+
+          await db.outbox.delete(item.id);
+          processed++;
+        } catch (itemErr) {
+          if (this.isNetworkError(itemErr)) break;
+          console.error('Lỗi khi gửi bản ghi outbox:', itemErr);
+          await db.outbox.update(item.id, {
+            retry_count: (item.retry_count || 0) + 1,
+            last_error: itemErr instanceof Error ? itemErr.message : String(itemErr),
+          });
+        }
+      }
+    } finally {
+      this.isProcessingOutbox = false;
+      this.notifyListeners();
+    }
+
+    const remaining = await db.outbox.count();
+    return { processed, remaining };
+  }
+
+  /**
+   * Helper: Tải toàn bộ dữ liệu của một bảng từ Supabase có phân trang (tránh giới hạn 1000 dòng)
+   */
+  private static async fetchAllFromSupabase<T>(
+    tableName: string,
+    ownerId: string,
+    lastSync: string | null
+  ): Promise<T[]> {
+    const pageSize = 1000;
+    let from = 0;
+    let allRows: T[] = [];
+    let hasMore = true;
+
+    while (hasMore) {
+      let query = supabase
+        .from(tableName)
+        .select('*')
+        .eq('owner_id', ownerId)
+        .order(tableName === 'thanh_toan' ? 'created_at' : 'updated_at', { ascending: true })
+        .range(from, from + pageSize - 1);
+
+      if (lastSync) {
+        const timeColumn = tableName === 'thanh_toan' ? 'created_at' : 'updated_at';
+        query = query.gt(timeColumn, lastSync);
+      }
+
+      const { data, error } = await query;
+      if (error) throw error;
+
+      if (data && data.length > 0) {
+        allRows = allRows.concat(data as T[]);
+        if (data.length < pageSize) {
+          hasMore = false;
+        } else {
+          from += pageSize;
+        }
+      } else {
+        hasMore = false;
+      }
+    }
+
+    return allRows;
+  }
+
+  /**
+   * Tải toàn bộ dữ liệu từ Supabase về Dexie (Hỗ trợ phân trang và delta sync)
    */
   static async syncFromSupabase(ownerId: string): Promise<{ success: boolean; message: string }> {
-    if (!isSupabaseConfigured() || !navigator.onLine) {
-      return { success: false, message: 'Đang ngoại tuyến hoặc chưa cấu hình Supabase.' };
+    if (!isSupabaseConfigured()) {
+      return { success: true, message: 'Chế độ phát triển Dev Mock.' };
+    }
+
+    if (!navigator.onLine) {
+      return { success: false, message: 'Đang ngoại tuyến, hiển thị dữ liệu lưu đệm trên máy.' };
     }
 
     try {
       const lastSync = localStorage.getItem(this.lastSyncKey);
-      
-      // 1. Tải Tòa nhà
-      let toaQuery = supabase.from('toa_nha').select('*').eq('owner_id', ownerId);
-      if (lastSync) toaQuery = toaQuery.gt('updated_at', lastSync);
-      const { data: toas, error: errToa } = await toaQuery;
-      if (errToa) throw errToa;
-      if (toas && toas.length > 0) await db.toa_nha.bulkPut(toas as ToaNha[]);
 
-      // 2. Tải Phòng
-      let phongQuery = supabase.from('phong').select('*').eq('owner_id', ownerId);
-      if (lastSync) phongQuery = phongQuery.gt('updated_at', lastSync);
-      const { data: phongs, error: errPhong } = await phongQuery;
-      if (errPhong) throw errPhong;
-      if (phongs && phongs.length > 0) await db.phong.bulkPut(phongs as Phong[]);
+      // 1. Tòa nhà
+      const toas = await this.fetchAllFromSupabase<ToaNha>('toa_nha', ownerId, lastSync);
+      if (toas.length > 0) await db.toa_nha.bulkPut(toas);
 
-      // 3. Tải Hợp đồng
-      let hdQuery = supabase.from('hop_dong').select('*').eq('owner_id', ownerId);
-      if (lastSync) hdQuery = hdQuery.gt('updated_at', lastSync);
-      const { data: hopDongs, error: errHd } = await hdQuery;
-      if (errHd) throw errHd;
-      if (hopDongs && hopDongs.length > 0) await db.hop_dong.bulkPut(hopDongs as HopDong[]);
+      // 2. Phòng
+      const phongs = await this.fetchAllFromSupabase<Phong>('phong', ownerId, lastSync);
+      if (phongs.length > 0) await db.phong.bulkPut(phongs);
 
-      // 4. Tải Sinh viên
-      let svQuery = supabase.from('sinh_vien').select('*').eq('owner_id', ownerId);
-      if (lastSync) svQuery = svQuery.gt('updated_at', lastSync);
-      const { data: sinhViens, error: errSv } = await svQuery;
-      if (errSv) throw errSv;
-      if (sinhViens && sinhViens.length > 0) await db.sinh_vien.bulkPut(sinhViens as SinhVien[]);
+      // 3. Hợp đồng
+      const hopDongs = await this.fetchAllFromSupabase<HopDong>('hop_dong', ownerId, lastSync);
+      if (hopDongs.length > 0) await db.hop_dong.bulkPut(hopDongs);
 
-      // 5. Tải Chỉ số
-      let csQuery = supabase.from('chi_so').select('*').eq('owner_id', ownerId);
-      if (lastSync) csQuery = csQuery.gt('updated_at', lastSync);
-      const { data: chiSos, error: errCs } = await csQuery;
-      if (errCs) throw errCs;
-      if (chiSos && chiSos.length > 0) await db.chi_so.bulkPut(chiSos as ChiSo[]);
+      // 4. Sinh viên
+      const sinhViens = await this.fetchAllFromSupabase<SinhVien>('sinh_vien', ownerId, lastSync);
+      if (sinhViens.length > 0) await db.sinh_vien.bulkPut(sinhViens);
 
-      // 6. Tải Hóa đơn
-      let hdBillQuery = supabase.from('hoa_don').select('*').eq('owner_id', ownerId);
-      if (lastSync) hdBillQuery = hdBillQuery.gt('updated_at', lastSync);
-      const { data: hoaDons, error: errHdBills } = await hdBillQuery;
-      if (errHdBills) throw errHdBills;
-      if (hoaDons && hoaDons.length > 0) await db.hoa_don.bulkPut(hoaDons as HoaDon[]);
+      // 5. Chỉ số
+      const chiSos = await this.fetchAllFromSupabase<ChiSo>('chi_so', ownerId, lastSync);
+      if (chiSos.length > 0) await db.chi_so.bulkPut(chiSos);
 
-      // 7. Tải Thanh toán
-      let ttQuery = supabase.from('thanh_toan').select('*').eq('owner_id', ownerId);
-      if (lastSync) ttQuery = ttQuery.gt('created_at', lastSync);
-      const { data: thanhToans, error: errTt } = await ttQuery;
-      if (errTt) throw errTt;
-      if (thanhToans && thanhToans.length > 0) await db.thanh_toan.bulkPut(thanhToans as ThanhToan[]);
+      // 6. Hóa đơn
+      const hoaDons = await this.fetchAllFromSupabase<HoaDon>('hoa_don', ownerId, lastSync);
+      if (hoaDons.length > 0) await db.hoa_don.bulkPut(hoaDons);
 
-      // 8. Tải Chi phí
-      let cpQuery = supabase.from('chi_phi').select('*').eq('owner_id', ownerId);
-      if (lastSync) cpQuery = cpQuery.gt('updated_at', lastSync);
-      const { data: chiPhis, error: errCp } = await cpQuery;
-      if (errCp) throw errCp;
-      if (chiPhis && chiPhis.length > 0) await db.chi_phi.bulkPut(chiPhis as ChiPhi[]);
+      // 7. Thanh toán
+      const thanhToans = await this.fetchAllFromSupabase<ThanhToan>('thanh_toan', ownerId, lastSync);
+      if (thanhToans.length > 0) await db.thanh_toan.bulkPut(thanhToans);
 
-      // 9. Cài đặt
-      const { data: caiDats, error: errCd } = await supabase
+      // 8. Chi phí
+      const chiPhis = await this.fetchAllFromSupabase<ChiPhi>('chi_phi', ownerId, lastSync);
+      if (chiPhis.length > 0) await db.chi_phi.bulkPut(chiPhis);
+
+      // 9. Cài đặt hệ thống
+      const { data: cd, error: errCd } = await supabase
         .from('cai_dat')
         .select('*')
         .eq('owner_id', ownerId)
         .maybeSingle();
-      if (!errCd && caiDats) {
-        await db.cai_dat.put(caiDats as CaiDat);
+      if (!errCd && cd) {
+        await db.cai_dat.put(cd as CaiDat);
       }
 
-      // Lưu mốc thời gian đồng bộ
+      // Xử lý nốt hàng đợi outbox (nếu có)
+      await this.processOutbox();
+
+      // Lưu mốc thời gian đồng bộ thành công
       localStorage.setItem(this.lastSyncKey, new Date().toISOString());
+      this.notifyListeners();
       return { success: true, message: 'Đồng bộ dữ liệu thành công.' };
     } catch (err: unknown) {
-      console.error('Lỗi trong quá trình đồng bộ Supabase:', err);
+      console.error('Lỗi khi tải dữ liệu từ Supabase:', err);
       return {
         success: false,
-        message: err instanceof Error ? err.message : 'Không thể kết nối máy chủ.',
+        message: err instanceof Error ? err.message : 'Không thể kết nối máy chủ Supabase.',
       };
     }
   }
 
+  // =========================================================================
+  // CÁC THAO TÁC GHI DỮ LIỆU (OPTIMISTIC UI + ROLLBACK + OUTBOX)
+  // =========================================================================
+
   /**
-   * Lưu thông tin Tòa (Thêm mới hoặc cập nhật)
+   * Lưu Tòa nhà
    */
   static async saveToaNha(toa: ToaNha): Promise<void> {
+    const previous = await db.toa_nha.get(toa.id);
     toa.updated_at = new Date().toISOString();
     await db.toa_nha.put(toa);
 
-    if (isSupabaseConfigured() && navigator.onLine) {
-      try {
-        await supabase.from('toa_nha').upsert(toa);
-      } catch (err) {
-        console.error('Không thể đồng bộ tòa lên Supabase:', err);
+    if (!isSupabaseConfigured()) return;
+
+    if (!navigator.onLine) {
+      await this.addToOutbox('toa_nha', 'upsert', toa.id, toa);
+      return;
+    }
+
+    try {
+      const payload = this.sanitizePayload('toa_nha', toa as unknown as Record<string, unknown>);
+      const { error } = await supabase.from('toa_nha').upsert(payload);
+      if (error) {
+        if (this.isNetworkError(error)) {
+          await this.addToOutbox('toa_nha', 'upsert', toa.id, toa);
+        } else {
+          // Hoàn tác Dexie nếu lỗi nghiệp vụ/CSDL
+          if (previous) await db.toa_nha.put(previous);
+          else await db.toa_nha.delete(toa.id);
+          throw new Error(`Lỗi lưu Tòa lên máy chủ: ${error.message}`);
+        }
+      }
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        await this.addToOutbox('toa_nha', 'upsert', toa.id, toa);
+      } else {
+        if (previous) await db.toa_nha.put(previous);
+        else await db.toa_nha.delete(toa.id);
+        throw err;
       }
     }
   }
 
   /**
-   * Xóa mềm Tòa (is_deleted: true)
+   * Xóa mềm Tòa nhà
    */
   static async deleteToaNha(toaId: string): Promise<void> {
-    const toa = await db.toa_nha.get(toaId);
-    if (!toa) return;
+    const previous = await db.toa_nha.get(toaId);
+    if (!previous) return;
 
-    toa.is_deleted = true;
-    toa.updated_at = new Date().toISOString();
-    await db.toa_nha.put(toa);
+    const updatedToa = { ...previous, is_deleted: true, updated_at: new Date().toISOString() };
+    await db.toa_nha.put(updatedToa);
 
-    if (isSupabaseConfigured() && navigator.onLine) {
-      try {
-        await supabase.from('toa_nha').update({ is_deleted: true, updated_at: toa.updated_at }).eq('id', toaId);
-      } catch (err) {
-        console.error('Không thể đồng bộ xóa tòa lên Supabase:', err);
+    if (!isSupabaseConfigured()) return;
+
+    if (!navigator.onLine) {
+      await this.addToOutbox('toa_nha', 'upsert', toaId, updatedToa);
+      return;
+    }
+
+    try {
+      const { error } = await supabase
+        .from('toa_nha')
+        .update({ is_deleted: true, updated_at: updatedToa.updated_at })
+        .eq('id', toaId);
+      if (error) {
+        if (this.isNetworkError(error)) {
+          await this.addToOutbox('toa_nha', 'upsert', toaId, updatedToa);
+        } else {
+          await db.toa_nha.put(previous);
+          throw new Error(`Lỗi xóa Tòa trên máy chủ: ${error.message}`);
+        }
+      }
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        await this.addToOutbox('toa_nha', 'upsert', toaId, updatedToa);
+      } else {
+        await db.toa_nha.put(previous);
+        throw err;
       }
     }
   }
 
   /**
-   * Lưu thông tin phòng (Optimistic: Cập nhật Dexie trước -> Đẩy lên Supabase sau)
+   * Lưu Phòng
    */
   static async savePhong(phong: Phong): Promise<void> {
+    const previous = await db.phong.get(phong.id);
     phong.updated_at = new Date().toISOString();
     await db.phong.put(phong);
 
-    if (isSupabaseConfigured() && navigator.onLine) {
-      try {
-        await supabase.from('phong').upsert(phong);
-      } catch (err) {
-        console.error('Không thể đồng bộ phòng lên Supabase:', err);
+    if (!isSupabaseConfigured()) return;
+
+    if (!navigator.onLine) {
+      await this.addToOutbox('phong', 'upsert', phong.id, phong);
+      return;
+    }
+
+    try {
+      const payload = this.sanitizePayload('phong', phong as unknown as Record<string, unknown>);
+      const { error } = await supabase.from('phong').upsert(payload);
+      if (error) {
+        if (this.isNetworkError(error)) {
+          await this.addToOutbox('phong', 'upsert', phong.id, phong);
+        } else {
+          if (previous) await db.phong.put(previous);
+          else await db.phong.delete(phong.id);
+          throw new Error(`Lỗi lưu phòng lên máy chủ: ${error.message}`);
+        }
+      }
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        await this.addToOutbox('phong', 'upsert', phong.id, phong);
+      } else {
+        if (previous) await db.phong.put(previous);
+        else await db.phong.delete(phong.id);
+        throw err;
       }
     }
   }
 
   /**
-   * Lưu sinh viên (Thêm mới hoặc sửa thông tin)
+   * Lưu Sinh viên
    */
   static async saveSinhVien(sv: SinhVien): Promise<void> {
+    const previous = await db.sinh_vien.get(sv.id);
     sv.updated_at = new Date().toISOString();
     await db.sinh_vien.put(sv);
 
-    if (isSupabaseConfigured() && navigator.onLine) {
-      try {
-        await supabase.from('sinh_vien').upsert(sv);
-      } catch (err) {
-        console.error('Không thể đồng bộ sinh viên lên Supabase:', err);
+    if (!isSupabaseConfigured()) return;
+
+    if (!navigator.onLine) {
+      await this.addToOutbox('sinh_vien', 'upsert', sv.id, sv);
+      return;
+    }
+
+    try {
+      const payload = this.sanitizePayload('sinh_vien', sv as unknown as Record<string, unknown>);
+      const { error } = await supabase.from('sinh_vien').upsert(payload);
+      if (error) {
+        if (this.isNetworkError(error)) {
+          await this.addToOutbox('sinh_vien', 'upsert', sv.id, sv);
+        } else {
+          if (previous) await db.sinh_vien.put(previous);
+          else await db.sinh_vien.delete(sv.id);
+          throw new Error(`Lỗi lưu sinh viên lên máy chủ: ${error.message}`);
+        }
+      }
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        await this.addToOutbox('sinh_vien', 'upsert', sv.id, sv);
+      } else {
+        if (previous) await db.sinh_vien.put(previous);
+        else await db.sinh_vien.delete(sv.id);
+        throw err;
       }
     }
   }
 
   /**
-   * Đánh dấu sinh viên rời phòng (Soft delete: không xóa cứng dữ liệu)
+   * Đánh dấu sinh viên rời phòng
    */
   static async removeSinhVien(svId: string): Promise<void> {
-    const sv = await db.sinh_vien.get(svId);
-    if (!sv) return;
+    const previous = await db.sinh_vien.get(svId);
+    if (!previous) return;
 
-    sv.dang_o = false;
-    sv.updated_at = new Date().toISOString();
-    await db.sinh_vien.put(sv);
+    const updated = { ...previous, dang_o: false, updated_at: new Date().toISOString() };
+    await db.sinh_vien.put(updated);
 
-    if (isSupabaseConfigured() && navigator.onLine) {
-      try {
-        await supabase.from('sinh_vien').update({ dang_o: false, updated_at: sv.updated_at }).eq('id', svId);
-      } catch (err) {
-        console.error('Không thể cập nhật trạng thái rời phòng lên server:', err);
+    if (!isSupabaseConfigured()) return;
+
+    if (!navigator.onLine) {
+      await this.addToOutbox('sinh_vien', 'upsert', svId, updated);
+      return;
+    }
+
+    try {
+      const { error } = await supabase
+        .from('sinh_vien')
+        .update({ dang_o: false, updated_at: updated.updated_at })
+        .eq('id', svId);
+      if (error) {
+        if (this.isNetworkError(error)) {
+          await this.addToOutbox('sinh_vien', 'upsert', svId, updated);
+        } else {
+          await db.sinh_vien.put(previous);
+          throw new Error(`Lỗi cập nhật sinh viên rời phòng: ${error.message}`);
+        }
+      }
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        await this.addToOutbox('sinh_vien', 'upsert', svId, updated);
+      } else {
+        await db.sinh_vien.put(previous);
+        throw err;
       }
     }
   }
 
   /**
-   * Lưu hợp đồng thuê phòng
+   * Lưu Hợp đồng
    */
   static async saveHopDong(hd: HopDong): Promise<void> {
+    const previous = await db.hop_dong.get(hd.id);
     hd.updated_at = new Date().toISOString();
     await db.hop_dong.put(hd);
 
-    if (isSupabaseConfigured() && navigator.onLine) {
-      try {
-        await supabase.from('hop_dong').upsert(hd);
-      } catch (err) {
-        console.error('Không thể đồng bộ hợp đồng lên Supabase:', err);
+    if (!isSupabaseConfigured()) return;
+
+    if (!navigator.onLine) {
+      await this.addToOutbox('hop_dong', 'upsert', hd.id, hd);
+      return;
+    }
+
+    try {
+      const payload = this.sanitizePayload('hop_dong', hd as unknown as Record<string, unknown>);
+      const { error } = await supabase.from('hop_dong').upsert(payload);
+      if (error) {
+        if (this.isNetworkError(error)) {
+          await this.addToOutbox('hop_dong', 'upsert', hd.id, hd);
+        } else {
+          if (previous) await db.hop_dong.put(previous);
+          else await db.hop_dong.delete(hd.id);
+          throw new Error(`Lỗi lưu hợp đồng lên máy chủ: ${error.message}`);
+        }
+      }
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        await this.addToOutbox('hop_dong', 'upsert', hd.id, hd);
+      } else {
+        if (previous) await db.hop_dong.put(previous);
+        else await db.hop_dong.delete(hd.id);
+        throw err;
       }
     }
   }
@@ -220,20 +568,17 @@ export class SyncService {
     const phong = await db.phong.get(phongId);
     if (!phong) return;
 
-    // 1. Cập nhật phòng
     phong.trang_thai = 'trong';
     phong.ngay_trong_tu = ngayTra;
     phong.updated_at = new Date().toISOString();
     await db.phong.put(phong);
 
-    // 2. Kết thúc hợp đồng đang hiệu lực
     const hopDong = await db.hop_dong.where({ phong_id: phongId, dang_hieu_luc: 1 as unknown as boolean }).first();
     if (hopDong) {
       hopDong.dang_hieu_luc = false;
       hopDong.updated_at = new Date().toISOString();
       await db.hop_dong.put(hopDong);
 
-      // Đánh dấu toàn bộ sinh viên trong hợp đồng này ngừng ở
       const sinhViens = await db.sinh_vien.where({ hop_dong_id: hopDong.id }).toArray();
       for (const sv of sinhViens) {
         sv.dang_o = false;
@@ -242,33 +587,109 @@ export class SyncService {
       }
     }
 
-    // 3. Đẩy lên Supabase nếu có mạng
-    if (isSupabaseConfigured() && navigator.onLine) {
-      try {
-        await supabase.from('phong').update({
-          trang_thai: 'trong',
-          updated_at: phong.updated_at,
-        }).eq('id', phongId);
+    if (!isSupabaseConfigured()) return;
 
-        if (hopDong) {
-          await supabase.from('hop_dong').update({
-            dang_hieu_luc: false,
-            updated_at: hopDong.updated_at,
-          }).eq('id', hopDong.id);
+    if (!navigator.onLine) {
+      await this.addToOutbox('phong', 'upsert', phongId, phong);
+      if (hopDong) {
+        await this.addToOutbox('hop_dong', 'upsert', hopDong.id, hopDong);
+      }
+      return;
+    }
 
-          await supabase.from('sinh_vien').update({
-            dang_o: false,
-            updated_at: new Date().toISOString(),
-          }).eq('hop_dong_id', hopDong.id);
+    try {
+      await supabase.from('phong').update({
+        trang_thai: 'trong',
+        ngay_trong_tu: ngayTra,
+        updated_at: phong.updated_at,
+      }).eq('id', phongId);
+
+      if (hopDong) {
+        await supabase.from('hop_dong').update({
+          dang_hieu_luc: false,
+          updated_at: hopDong.updated_at,
+        }).eq('id', hopDong.id);
+
+        await supabase.from('sinh_vien').update({
+          dang_o: false,
+          updated_at: new Date().toISOString(),
+        }).eq('hop_dong_id', hopDong.id);
+      }
+    } catch (err) {
+      console.error('Lỗi khi đồng bộ thủ tục trả phòng:', err);
+    }
+  }
+
+  /**
+   * Lưu hàng loạt Chỉ số điện nước (Meter Readings)
+   */
+  static async saveChiSoBatch(chiSos: ChiSo[]): Promise<void> {
+    await db.chi_so.bulkPut(chiSos);
+
+    if (!isSupabaseConfigured()) return;
+
+    if (!navigator.onLine) {
+      for (const cs of chiSos) {
+        await this.addToOutbox('chi_so', 'upsert', cs.id, cs);
+      }
+      return;
+    }
+
+    try {
+      const sanitized = chiSos.map((cs) => this.sanitizePayload('chi_so', cs as unknown as Record<string, unknown>));
+      const { error } = await supabase.from('chi_so').upsert(sanitized);
+      if (error) {
+        if (this.isNetworkError(error)) {
+          for (const cs of chiSos) await this.addToOutbox('chi_so', 'upsert', cs.id, cs);
+        } else {
+          throw new Error(`Lỗi đẩy chỉ số lên Supabase: ${error.message}`);
         }
-      } catch (err) {
-        console.error('Lỗi khi đồng bộ thủ tục trả phòng:', err);
+      }
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        for (const cs of chiSos) await this.addToOutbox('chi_so', 'upsert', cs.id, cs);
+      } else {
+        throw err;
       }
     }
   }
 
   /**
-   * Cập nhật nhanh trạng thái thanh toán hóa đơn (Optimistic UI)
+   * Lưu hàng loạt Hóa đơn (Invoices)
+   */
+  static async saveHoaDonBatch(hoaDons: HoaDon[]): Promise<void> {
+    await db.hoa_don.bulkPut(hoaDons);
+
+    if (!isSupabaseConfigured()) return;
+
+    if (!navigator.onLine) {
+      for (const hd of hoaDons) {
+        await this.addToOutbox('hoa_don', 'upsert', hd.id, hd);
+      }
+      return;
+    }
+
+    try {
+      const sanitized = hoaDons.map((hd) => this.sanitizePayload('hoa_don', hd as unknown as Record<string, unknown>));
+      const { error } = await supabase.from('hoa_don').upsert(sanitized);
+      if (error) {
+        if (this.isNetworkError(error)) {
+          for (const hd of hoaDons) await this.addToOutbox('hoa_don', 'upsert', hd.id, hd);
+        } else {
+          throw new Error(`Lỗi đẩy hóa đơn lên Supabase: ${error.message}`);
+        }
+      }
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        for (const hd of hoaDons) await this.addToOutbox('hoa_don', 'upsert', hd.id, hd);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * Cập nhật thanh toán hóa đơn
    */
   static async updatePaymentStatus(
     hoaDonId: string,
@@ -278,6 +699,9 @@ export class SyncService {
   ): Promise<HoaDon | null> {
     const hoaDon = await db.hoa_don.get(hoaDonId);
     if (!hoaDon) return null;
+
+    const previousDaDong = hoaDon.da_dong;
+    const previousTrangThai = hoaDon.trang_thai;
 
     hoaDon.da_dong = daDongMoi;
     hoaDon.con_no = Math.max(0, hoaDon.tong_tien - daDongMoi);
@@ -290,11 +714,11 @@ export class SyncService {
     }
     hoaDon.updated_at = new Date().toISOString();
 
-    // 1. Cập nhật Dexie ngay tức khắc
+    // 1. Cập nhật Dexie
     await db.hoa_don.put(hoaDon);
 
-    // 2. Thêm bản ghi thanh toán
-    const paymentId = `tt-${Date.now()}`;
+    // 2. Thêm bản ghi thanh toán dùng UUID
+    const paymentId = crypto.randomUUID();
     const thanhToan: ThanhToan = {
       id: paymentId,
       owner_id: hoaDon.owner_id,
@@ -307,19 +731,34 @@ export class SyncService {
     };
     await db.thanh_toan.put(thanhToan);
 
-    // 3. Đồng bộ Supabase nếu có mạng
-    if (isSupabaseConfigured() && navigator.onLine) {
-      try {
-        await supabase.from('hoa_don').update({
-          da_dong: hoaDon.da_dong,
-          con_no: hoaDon.con_no,
-          trang_thai: hoaDon.trang_thai,
-          updated_at: hoaDon.updated_at,
-        }).eq('id', hoaDon.id);
+    if (!isSupabaseConfigured()) return hoaDon;
 
-        await supabase.from('thanh_toan').insert(thanhToan);
-      } catch (err) {
-        console.error('Lỗi đồng bộ thanh toán lên Supabase:', err);
+    if (!navigator.onLine) {
+      await this.addToOutbox('hoa_don', 'upsert', hoaDon.id, hoaDon);
+      await this.addToOutbox('thanh_toan', 'upsert', paymentId, thanhToan);
+      return hoaDon;
+    }
+
+    try {
+      const sanitizedHd = this.sanitizePayload('hoa_don', hoaDon as unknown as Record<string, unknown>);
+      const { error: errHd } = await supabase.from('hoa_don').upsert(sanitizedHd);
+      if (errHd) throw errHd;
+
+      const sanitizedTt = this.sanitizePayload('thanh_toan', thanhToan as unknown as Record<string, unknown>);
+      const { error: errTt } = await supabase.from('thanh_toan').insert(sanitizedTt);
+      if (errTt) throw errTt;
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        await this.addToOutbox('hoa_don', 'upsert', hoaDon.id, hoaDon);
+        await this.addToOutbox('thanh_toan', 'upsert', paymentId, thanhToan);
+      } else {
+        // Rollback
+        hoaDon.da_dong = previousDaDong;
+        hoaDon.con_no = Math.max(0, hoaDon.tong_tien - previousDaDong);
+        hoaDon.trang_thai = previousTrangThai;
+        await db.hoa_don.put(hoaDon);
+        await db.thanh_toan.delete(paymentId);
+        throw new Error(`Lỗi cập nhật thanh toán lên máy chủ: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
@@ -327,7 +766,7 @@ export class SyncService {
   }
 
   /**
-   * Hoàn tác thanh toán hóa đơn
+   * Hoàn tác thanh toán
    */
   static async revertPayment(hoaDonId: string, previousDaDong: number): Promise<HoaDon | null> {
     const hoaDon = await db.hoa_don.get(hoaDonId);
@@ -346,16 +785,28 @@ export class SyncService {
 
     await db.hoa_don.put(hoaDon);
 
-    if (isSupabaseConfigured() && navigator.onLine) {
-      try {
-        await supabase.from('hoa_don').update({
-          da_dong: hoaDon.da_dong,
-          con_no: hoaDon.con_no,
-          trang_thai: hoaDon.trang_thai,
-          updated_at: hoaDon.updated_at,
-        }).eq('id', hoaDon.id);
-      } catch (err) {
-        console.error('Lỗi hoàn tác thanh toán lên Supabase:', err);
+    if (!isSupabaseConfigured()) return hoaDon;
+
+    if (!navigator.onLine) {
+      await this.addToOutbox('hoa_don', 'upsert', hoaDon.id, hoaDon);
+      return hoaDon;
+    }
+
+    try {
+      const sanitized = this.sanitizePayload('hoa_don', hoaDon as unknown as Record<string, unknown>);
+      const { error } = await supabase.from('hoa_don').upsert(sanitized);
+      if (error) {
+        if (this.isNetworkError(error)) {
+          await this.addToOutbox('hoa_don', 'upsert', hoaDon.id, hoaDon);
+        } else {
+          throw error;
+        }
+      }
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        await this.addToOutbox('hoa_don', 'upsert', hoaDon.id, hoaDon);
+      } else {
+        console.error('Lỗi hoàn tác thanh toán:', err);
       }
     }
 
@@ -363,17 +814,39 @@ export class SyncService {
   }
 
   /**
-   * Lưu chi phí vận hành (Thêm mới / sửa)
+   * Lưu chi phí vận hành
    */
   static async saveChiPhi(chiPhi: ChiPhi): Promise<void> {
+    const previous = await db.chi_phi.get(chiPhi.id);
     chiPhi.updated_at = new Date().toISOString();
     await db.chi_phi.put(chiPhi);
 
-    if (isSupabaseConfigured() && navigator.onLine) {
-      try {
-        await supabase.from('chi_phi').upsert(chiPhi);
-      } catch (err) {
-        console.error('Lỗi đồng bộ chi phí lên Supabase:', err);
+    if (!isSupabaseConfigured()) return;
+
+    if (!navigator.onLine) {
+      await this.addToOutbox('chi_phi', 'upsert', chiPhi.id, chiPhi);
+      return;
+    }
+
+    try {
+      const payload = this.sanitizePayload('chi_phi', chiPhi as unknown as Record<string, unknown>);
+      const { error } = await supabase.from('chi_phi').upsert(payload);
+      if (error) {
+        if (this.isNetworkError(error)) {
+          await this.addToOutbox('chi_phi', 'upsert', chiPhi.id, chiPhi);
+        } else {
+          if (previous) await db.chi_phi.put(previous);
+          else await db.chi_phi.delete(chiPhi.id);
+          throw new Error(`Lỗi lưu chi phí lên máy chủ: ${error.message}`);
+        }
+      }
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        await this.addToOutbox('chi_phi', 'upsert', chiPhi.id, chiPhi);
+      } else {
+        if (previous) await db.chi_phi.put(previous);
+        else await db.chi_phi.delete(chiPhi.id);
+        throw err;
       }
     }
   }
@@ -382,14 +855,78 @@ export class SyncService {
    * Xóa chi phí vận hành
    */
   static async deleteChiPhi(chiPhiId: string): Promise<void> {
+    const previous = await db.chi_phi.get(chiPhiId);
     await db.chi_phi.delete(chiPhiId);
 
-    if (isSupabaseConfigured() && navigator.onLine) {
-      try {
-        await supabase.from('chi_phi').delete().eq('id', chiPhiId);
-      } catch (err) {
-        console.error('Lỗi xóa chi phí trên Supabase:', err);
+    if (!isSupabaseConfigured()) return;
+
+    if (!navigator.onLine) {
+      await this.addToOutbox('chi_phi', 'delete', chiPhiId, {});
+      return;
+    }
+
+    try {
+      const { error } = await supabase.from('chi_phi').delete().eq('id', chiPhiId);
+      if (error) {
+        if (this.isNetworkError(error)) {
+          await this.addToOutbox('chi_phi', 'delete', chiPhiId, {});
+        } else {
+          if (previous) await db.chi_phi.put(previous);
+          throw new Error(`Lỗi xóa chi phí trên máy chủ: ${error.message}`);
+        }
+      }
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        await this.addToOutbox('chi_phi', 'delete', chiPhiId, {});
+      } else {
+        if (previous) await db.chi_phi.put(previous);
+        throw err;
       }
     }
   }
+
+  /**
+   * Lưu cấu hình cài đặt hệ thống (VietQR, Mẫu tin nhắn...)
+   */
+  static async saveCaiDat(caiDat: CaiDat): Promise<void> {
+    const previous = await db.cai_dat.get(caiDat.owner_id);
+    caiDat.updated_at = new Date().toISOString();
+    await db.cai_dat.put(caiDat);
+
+    if (!isSupabaseConfigured()) return;
+
+    if (!navigator.onLine) {
+      await this.addToOutbox('cai_dat', 'upsert', caiDat.owner_id, caiDat);
+      return;
+    }
+
+    try {
+      const payload = this.sanitizePayload('cai_dat', caiDat as unknown as Record<string, unknown>);
+      const { error } = await supabase.from('cai_dat').upsert(payload, { onConflict: 'owner_id' });
+      if (error) {
+        if (this.isNetworkError(error)) {
+          await this.addToOutbox('cai_dat', 'upsert', caiDat.owner_id, caiDat);
+        } else {
+          if (previous) await db.cai_dat.put(previous);
+          else await db.cai_dat.delete(caiDat.owner_id);
+          throw new Error(`Lỗi lưu cài đặt lên máy chủ: ${error.message}`);
+        }
+      }
+    } catch (err) {
+      if (this.isNetworkError(err)) {
+        await this.addToOutbox('cai_dat', 'upsert', caiDat.owner_id, caiDat);
+      } else {
+        if (previous) await db.cai_dat.put(previous);
+        else await db.cai_dat.delete(caiDat.owner_id);
+        throw err;
+      }
+    }
+  }
+}
+
+// Tự động xử lý outbox khi có kết nối mạng trở lại
+if (typeof window !== 'undefined') {
+  window.addEventListener('online', () => {
+    SyncService.processOutbox();
+  });
 }

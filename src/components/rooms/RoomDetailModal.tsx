@@ -17,7 +17,7 @@ import {
   Eye,
   QrCode,
 } from 'lucide-react';
-import type { PhongChiTiet, SinhVien, DoBanGiaoItem, Phong } from '../../types';
+import type { PhongChiTiet, SinhVien, DoBanGiaoItem, Phong, HopDong } from '../../types';
 import { formatVND, formatDate } from '../../utils/formatters';
 import { AddStudentModal } from './AddStudentModal';
 import { CccdViewerModal } from './CccdViewerModal';
@@ -25,6 +25,7 @@ import { CheckoutModal } from './CheckoutModal';
 import { EditRoomModal } from './EditRoomModal';
 import { InvoiceModal } from '../invoices/InvoiceModal';
 import { ContractModal } from '../contracts/ContractModal';
+import { NewContractModal } from '../contracts/NewContractModal';
 import { SyncService } from '../../db/sync';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../common/Toast';
@@ -54,12 +55,29 @@ export const RoomDetailModal: React.FC<RoomDetailModalProps> = ({
   const [showEditRoom, setShowEditRoom] = useState<boolean>(false);
   const [showInvoiceModal, setShowInvoiceModal] = useState<boolean>(false);
   const [showContractModal, setShowContractModal] = useState<boolean>(false);
+  const [showNewContractModal, setShowNewContractModal] = useState<boolean>(false);
 
   // Đồ bàn giao
   const hopDong = room.hop_dong_hien_tai;
   const [doBanGiaoList, setDoBanGiaoList] = useState<DoBanGiaoItem[]>(hopDong?.do_ban_giao || []);
   const [newDoTen, setNewDoTen] = useState('');
   const [newDoTinhTrang, setNewDoTinhTrang] = useState('');
+
+  // Lưu hợp đồng mới khi phòng trống
+  const handleSaveNewContract = async (newHd: HopDong, newSvs: SinhVien[]) => {
+    await SyncService.saveHopDong(newHd);
+    for (const sv of newSvs) {
+      await SyncService.saveSinhVien(sv);
+    }
+    const updatedRoom: Phong = {
+      ...room,
+      trang_thai: 'co_nguoi',
+      updated_at: new Date().toISOString(),
+    };
+    await SyncService.savePhong(updatedRoom);
+    setShowNewContractModal(false);
+    onRefresh();
+  };
 
   // Lưu sinh viên
   const handleSaveStudent = async (sv: SinhVien) => {
@@ -106,7 +124,7 @@ export const RoomDetailModal: React.FC<RoomDetailModalProps> = ({
   const handleAddDoBanGiao = async () => {
     if (!newDoTen.trim() || !hopDong) return;
     const newItem: DoBanGiaoItem = {
-      id: `dbg-${Date.now()}`,
+      id: crypto.randomUUID(),
       ten: newDoTen.trim(),
       so_luong: 1,
       tinh_trang: newDoTinhTrang.trim() || 'Tốt',
@@ -262,12 +280,19 @@ export const RoomDetailModal: React.FC<RoomDetailModalProps> = ({
                       <span>Xem & In hợp đồng thuê phòng (A4 / PDF)</span>
                     </button>
                   </div>
-                ) : room.trang_thai === 'trong' ? (
-                  <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-200 text-center space-y-2">
+                ) : room.trang_thai === 'trong' || !hopDong ? (
+                  <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-200 text-center space-y-2.5">
                     <p className="text-sm font-bold text-emerald-900">Phòng này đang trống!</p>
                     <p className="text-xs text-emerald-700">
-                      Chưa có hợp đồng nào đang hiệu lực. Bạn có thể ký hợp đồng mới khi có sinh viên đến thuê.
+                      Chưa có hợp đồng nào đang hiệu lực. Bấm nút dưới để ký hợp đồng và thêm đủ sinh viên vào phòng.
                     </p>
+                    <button
+                      onClick={() => setShowNewContractModal(true)}
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl shadow-sm inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Plus className="w-4 h-4" />
+                      <span>Ký hợp đồng & Thêm sinh viên vào phòng</span>
+                    </button>
                   </div>
                 ) : null}
 
@@ -681,6 +706,14 @@ export const RoomDetailModal: React.FC<RoomDetailModalProps> = ({
           sinhViens={room.sinh_vien_list}
           caiDat={caiDat}
           onClose={() => setShowContractModal(false)}
+        />
+      )}
+
+      {showNewContractModal && (
+        <NewContractModal
+          room={room}
+          onSave={handleSaveNewContract}
+          onClose={() => setShowNewContractModal(false)}
         />
       )}
     </>

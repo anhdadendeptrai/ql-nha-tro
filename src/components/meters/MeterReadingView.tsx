@@ -30,7 +30,7 @@ import {
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../common/Toast';
 import { InvoiceModal } from '../invoices/InvoiceModal';
-import { supabase, isSupabaseConfigured } from '../../services/supabase';
+import { SyncService } from '../../db/sync';
 
 interface RoomReadingDraft {
   phongId: string;
@@ -344,7 +344,7 @@ export const MeterReadingView: React.FC<MeterReadingViewProps> = ({
       const draft = prev[phongId];
       if (!draft) return prev;
 
-      const updatedPhuPhi = [...draft.phuPhi, { id: `pp-${Date.now()}`, ten: ten.trim(), so_tien: soTien }];
+      const updatedPhuPhi = [...draft.phuPhi, { id: crypto.randomUUID(), ten: ten.trim(), so_tien: soTien }];
       const phuPhiTong = updatedPhuPhi.reduce((acc, cur) => acc + (cur.so_tien || 0), 0);
       const tongTien = draft.tienPhong + draft.tienDien + draft.tienDichVu + phuPhiTong;
 
@@ -423,7 +423,8 @@ export const MeterReadingView: React.FC<MeterReadingViewProps> = ({
 
       for (const draft of Object.values(drafts)) {
         // 1. Bản ghi chỉ số điện
-        const chiSoId = `cs-${draft.phongId}-${selectedMonth}`;
+        const existingCs = rawChiSos.find((cs) => cs.phong_id === draft.phongId && cs.thang === selectedMonth);
+        const chiSoId = existingCs?.id || crypto.randomUUID();
         const chiSoRecord: ChiSo = {
           id: chiSoId,
           owner_id: ownerId,
@@ -431,13 +432,13 @@ export const MeterReadingView: React.FC<MeterReadingViewProps> = ({
           thang: selectedMonth,
           dien_dau: draft.dienDau,
           dien_cuoi: draft.dienCuoi,
-          created_at: new Date().toISOString(),
+          created_at: existingCs?.created_at || new Date().toISOString(),
           updated_at: new Date().toISOString(),
         };
         chiSoBatch.push(chiSoRecord);
 
         // 2. Bản ghi hóa đơn (snapshot toàn bộ đơn giá tại thời điểm chốt)
-        const hoaDonId = draft.existingHoaDon?.id || `hd-${draft.phongId}-${selectedMonth}`;
+        const hoaDonId = draft.existingHoaDon?.id || crypto.randomUUID();
         const daDong = draft.existingHoaDon ? draft.existingHoaDon.da_dong : 0;
         const conNo = Math.max(0, draft.tongTien - daDong);
         const trangThai = conNo === 0 && draft.tongTien > 0 ? 'da_dong' : daDong > 0 ? 'dong_thieu' : 'chua_dong';
@@ -469,19 +470,9 @@ export const MeterReadingView: React.FC<MeterReadingViewProps> = ({
         hoaDonBatch.push(hoaDonRecord);
       }
 
-      // Lưu hàng loạt vào Dexie IndexedDB
-      await db.chi_so.bulkPut(chiSoBatch);
-      await db.hoa_don.bulkPut(hoaDonBatch);
-
-      // Đẩy lên Supabase nếu có mạng
-      if (isSupabaseConfigured() && navigator.onLine) {
-        try {
-          await supabase.from('chi_so').upsert(chiSoBatch);
-          await supabase.from('hoa_don').upsert(hoaDonBatch);
-        } catch (err) {
-          console.error('Lỗi đẩy hóa đơn lên Supabase:', err);
-        }
-      }
+      // Lưu vào Dexie và tự động đẩy lên Supabase hoặc hàng đợi Outbox qua SyncService
+      await SyncService.saveChiSoBatch(chiSoBatch);
+      await SyncService.saveHoaDonBatch(hoaDonBatch);
 
       showToast(`Đã lưu chỉ số và sinh hóa đơn ${formatMonthYear(selectedMonth)} thành công!`, 'success');
     } catch {

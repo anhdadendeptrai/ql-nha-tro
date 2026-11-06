@@ -3,7 +3,7 @@ import { X, Copy, Check, MessageSquare, Edit3, Save } from 'lucide-react';
 import type { HoaDon, ToaNha, Phong, SinhVien, CaiDat, MauTinNhanItem } from '../../types';
 import { formatVND, formatMonthYear } from '../../utils/formatters';
 import { generateTransferContent } from '../../utils/vietqr';
-import { db } from '../../db/dexie';
+import { SyncService } from '../../db/sync';
 import { useToast } from '../common/Toast';
 
 interface ZaloMessageModalProps {
@@ -122,7 +122,7 @@ export const ZaloMessageModal: React.FC<ZaloMessageModalProps> = ({
     const updated = templates.map((t) =>
       t.id === selectedTemplateId ? { ...t, noi_dung: customText } : t
     );
-    await db.cai_dat.update(caiDat.owner_id, { mau_tin_nhan: updated });
+    await SyncService.saveCaiDat({ ...caiDat, mau_tin_nhan: updated });
     setIsEditing(false);
     showToast('Đã lưu mẫu tin nhắn mới!', 'success');
   };

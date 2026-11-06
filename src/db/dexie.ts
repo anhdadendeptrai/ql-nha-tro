@@ -9,6 +9,7 @@ import type {
   ThanhToan,
   ChiPhi,
   CaiDat,
+  OutboxItem,
 } from '../types';
 
 export class QuanLyPhongTroDB extends Dexie {
@@ -21,6 +22,7 @@ export class QuanLyPhongTroDB extends Dexie {
   thanh_toan!: Table<ThanhToan, string>;
   chi_phi!: Table<ChiPhi, string>;
   cai_dat!: Table<CaiDat, string>;
+  outbox!: Table<OutboxItem, string>;
 
   constructor() {
     super('QuanLyPhongTroDB');
@@ -60,6 +62,19 @@ export class QuanLyPhongTroDB extends Dexie {
         tx.table('chi_phi').clear(),
         tx.table('cai_dat').clear(),
       ]);
+    });
+
+    this.version(3).stores({
+      toa_nha: 'id, owner_id, ten',
+      phong: 'id, owner_id, toa_id, so_phong, tang, trang_thai',
+      hop_dong: 'id, owner_id, phong_id, dang_hieu_luc',
+      sinh_vien: 'id, owner_id, hop_dong_id, ho_ten, sdt, cccd, bien_so, dang_o',
+      chi_so: 'id, owner_id, phong_id, thang, [phong_id+thang]',
+      hoa_don: 'id, owner_id, phong_id, thang, trang_thai, [phong_id+thang]',
+      thanh_toan: 'id, owner_id, hoa_don_id, ngay',
+      chi_phi: 'id, owner_id, toa_id, ngay, loai',
+      cai_dat: 'owner_id',
+      outbox: 'id, table_name, action, record_id, created_at',
     });
   }
 }
