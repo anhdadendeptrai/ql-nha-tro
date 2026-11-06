@@ -155,8 +155,8 @@ export const NewContractModal: React.FC<NewContractModalProps> = ({
         'success'
       );
       onClose();
-    } catch {
-      showToast('Có lỗi xảy ra khi tạo hợp đồng.', 'error');
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Có lỗi xảy ra khi tạo hợp đồng.', 'error');
     } finally {
       setIsSubmitting(false);
     }

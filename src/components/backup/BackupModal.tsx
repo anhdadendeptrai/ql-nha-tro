@@ -194,36 +194,66 @@ export const BackupModal: React.FC<BackupModalProps> = ({ onClose }) => {
       if (parsed.chi_phi?.length) await db.chi_phi.bulkPut(parsed.chi_phi);
       if (parsed.cai_dat?.length) await db.cai_dat.bulkPut(parsed.cai_dat);
 
-      // Đẩy lên Supabase nếu có kết nối
+      // Đẩy lên Supabase theo đúng thứ tự toàn cục bắt buộc:
+      // toa_nha -> phong -> hop_dong (null rep) -> sinh_vien -> update hop_dong (rep) -> hoa_don -> thanh_toan -> chi_so -> chi_phi -> cai_dat
       if (isSupabaseConfigured() && navigator.onLine) {
         try {
+          // 1. Tòa nhà
           if (normalizedToas.length) {
             const sanitized = normalizedToas.map((t) => SyncService.sanitizePayload('toa_nha', t as unknown as Record<string, unknown>));
             await supabase.from('toa_nha').upsert(sanitized);
           }
+          // 2. Phòng
           if (parsed.phong?.length) {
             const sanitized = parsed.phong.map((p: any) => SyncService.sanitizePayload('phong', p as Record<string, unknown>));
             await supabase.from('phong').upsert(sanitized);
           }
+          // 3. Hợp đồng (bắt buộc nguoi_dai_dien_id = null để tránh lỗi khóa ngoại 23503)
           if (parsed.hop_dong?.length) {
-            const sanitized = parsed.hop_dong.map((h: any) => SyncService.sanitizePayload('hop_dong', h as Record<string, unknown>));
-            await supabase.from('hop_dong').upsert(sanitized);
+            const sanitizedHd = parsed.hop_dong.map((h: any) =>
+              SyncService.sanitizePayload('hop_dong', { ...h, nguoi_dai_dien_id: null })
+            );
+            await supabase.from('hop_dong').upsert(sanitizedHd);
           }
+          // 4. Sinh viên
           if (parsed.sinh_vien?.length) {
             const sanitized = parsed.sinh_vien.map((s: any) => SyncService.sanitizePayload('sinh_vien', s as Record<string, unknown>));
             await supabase.from('sinh_vien').upsert(sanitized);
           }
-          if (parsed.chi_so?.length) {
-            const sanitized = parsed.chi_so.map((c: any) => SyncService.sanitizePayload('chi_so', c as Record<string, unknown>));
-            await supabase.from('chi_so').upsert(sanitized);
+          // 5. Cập nhật nguoi_dai_dien_id cho hợp đồng sau khi sinh viên đã tồn tại
+          if (parsed.hop_dong?.length) {
+            for (const h of parsed.hop_dong) {
+              if (h.nguoi_dai_dien_id) {
+                await supabase.from('hop_dong').update({ nguoi_dai_dien_id: h.nguoi_dai_dien_id }).eq('id', h.id);
+              }
+            }
           }
+          // 6. Hóa đơn
           if (normalizedHoaDons.length) {
             const sanitized = normalizedHoaDons.map((h: any) => SyncService.sanitizePayload('hoa_don', h as Record<string, unknown>));
             await supabase.from('hoa_don').upsert(sanitized);
           }
+          // 7. Thanh toán
+          if (parsed.thanh_toan?.length) {
+            const sanitized = parsed.thanh_toan.map((tt: any) => SyncService.sanitizePayload('thanh_toan', tt as Record<string, unknown>));
+            await supabase.from('thanh_toan').upsert(sanitized);
+          }
+          // 8. Chỉ số
+          if (parsed.chi_so?.length) {
+            const sanitized = parsed.chi_so.map((c: any) => SyncService.sanitizePayload('chi_so', c as Record<string, unknown>));
+            await supabase.from('chi_so').upsert(sanitized);
+          }
+          // 9. Chi phí
           if (parsed.chi_phi?.length) {
             const sanitized = parsed.chi_phi.map((c: any) => SyncService.sanitizePayload('chi_phi', c as Record<string, unknown>));
             await supabase.from('chi_phi').upsert(sanitized);
+          }
+          // 10. Cài đặt
+          if (parsed.cai_dat?.length) {
+            for (const cd of parsed.cai_dat) {
+              const sanitized = SyncService.sanitizePayload('cai_dat', cd as Record<string, unknown>);
+              await supabase.from('cai_dat').upsert(sanitized, { onConflict: 'owner_id' });
+            }
           }
         } catch (err) {
           console.error('Lỗi đồng bộ file khôi phục lên Supabase:', err);

@@ -63,20 +63,22 @@ export const RoomDetailModal: React.FC<RoomDetailModalProps> = ({
   const [newDoTen, setNewDoTen] = useState('');
   const [newDoTinhTrang, setNewDoTinhTrang] = useState('');
 
-  // Lưu hợp đồng mới khi phòng trống
+  // Lưu hợp đồng mới khi phòng trống (tuân thủ 3 bước tuần tự)
   const handleSaveNewContract = async (newHd: HopDong, newSvs: SinhVien[]) => {
-    await SyncService.saveHopDong(newHd);
-    for (const sv of newSvs) {
-      await SyncService.saveSinhVien(sv);
+    try {
+      await SyncService.saveHopDongWithStudents(newHd, newSvs);
+      const updatedRoom: Phong = {
+        ...room,
+        trang_thai: 'co_nguoi',
+        updated_at: new Date().toISOString(),
+      };
+      await SyncService.savePhong(updatedRoom);
+      setShowNewContractModal(false);
+      onRefresh();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Lỗi khi ký hợp đồng', 'error');
+      throw err;
     }
-    const updatedRoom: Phong = {
-      ...room,
-      trang_thai: 'co_nguoi',
-      updated_at: new Date().toISOString(),
-    };
-    await SyncService.savePhong(updatedRoom);
-    setShowNewContractModal(false);
-    onRefresh();
   };
 
   // Lưu sinh viên

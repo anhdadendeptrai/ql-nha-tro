@@ -208,7 +208,8 @@ export type OutboxTable =
   | 'hoa_don'
   | 'thanh_toan'
   | 'chi_phi'
-  | 'cai_dat';
+  | 'cai_dat'
+  | 'hop_dong_group';
 
 export interface OutboxItem {
   id: string; // UUID của hàng đợi

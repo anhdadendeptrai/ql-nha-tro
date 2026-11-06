@@ -5,6 +5,12 @@
  * 2. Optimistic UI: Ghi Dexie trước -> Đẩy Supabase sau. Nếu lỗi CSDL thì rollback Dexie và báo lỗi rõ ràng.
  * 3. Ngoại tuyến (Offline): Hàng đợi Outbox lưu lại thay đổi, tự động đẩy lên Supabase khi có mạng.
  * 4. Tất cả khóa chính phải là chuẩn UUID (crypto.randomUUID()) để tương thích kiểu UUID PostgreSQL.
+ * 5. Ký hợp đồng mới & Sinh viên:
+ *    - (a) upsert hop_dong với nguoi_dai_dien_id = null
+ *    - (b) upsert các sinh_vien thuộc hợp đồng
+ *    - (c) update hop_dong.nguoi_dai_dien_id = id đại diện
+ * 6. Thứ tự toàn cục khi đẩy outbox:
+ *    toa_nha -> phong -> hop_dong -> sinh_vien -> update nguoi_dai_dien_id -> hoa_don -> thanh_toan -> chi_so -> chi_phi -> cai_dat
  */
 
 import { db } from './dexie';
@@ -46,6 +52,35 @@ export class SyncService {
   }
 
   /**
+   * Chuyển đổi mã lỗi Supabase/PostgreSQL sang thông báo tiếng Việt thân thiện theo quy định:
+   * - 23503: "Dữ liệu liên quan chưa được lưu lên máy chủ"
+   * - 23505: "Dữ liệu bị trùng"
+   * - 42501: "Không có quyền ghi dữ liệu"
+   * - các mã khác thì kèm mã lỗi.
+   */
+  static formatSupabaseError(error: unknown): string {
+    if (!error) return 'Lỗi không xác định';
+    const errObj = error as { code?: string; message?: string };
+    const code = errObj.code ? String(errObj.code) : '';
+    if (code === '23503') {
+      return 'Dữ liệu liên quan chưa được lưu lên máy chủ';
+    }
+    if (code === '23505') {
+      return 'Dữ liệu bị trùng';
+    }
+    if (code === '42501') {
+      return 'Không có quyền ghi dữ liệu';
+    }
+    if (code) {
+      return `Lỗi máy chủ (${code}): ${errObj.message || 'Lỗi cơ sở dữ liệu'}`;
+    }
+    if (error instanceof Error) {
+      return error.message;
+    }
+    return String(error) || 'Không thể kết nối máy chủ';
+  }
+
+  /**
    * Kiểm tra lỗi có phải do mất mạng / ngoại tuyến không
    */
   static isNetworkError(err: unknown): boolean {
@@ -64,10 +99,34 @@ export class SyncService {
   }
 
   /**
+   * Tính toán độ ưu tiên toàn cục khi đẩy dữ liệu:
+   * toa_nha (10) -> phong (20) -> hop_dong (30) -> sinh_vien (40) -> update nguoi_dai_dien_id (50)
+   * -> hoa_don (60) -> thanh_toan (70) -> chi_so (80) -> chi_phi (90) -> cai_dat (100)
+   */
+  static getTablePriority(item: OutboxItem): number {
+    if (item.table_name === 'toa_nha') return 10;
+    if (item.table_name === 'phong') return 20;
+    if (item.table_name === 'hop_dong') return 30;
+    if (item.table_name === 'hop_dong_group') {
+      const step = item.payload?.step || 1;
+      if (step === 1) return 30;
+      if (step === 2) return 40;
+      return 50; // step 3: update nguoi_dai_dien_id
+    }
+    if (item.table_name === 'sinh_vien') return 40;
+    if (item.table_name === 'hoa_don') return 60;
+    if (item.table_name === 'thanh_toan') return 70;
+    if (item.table_name === 'chi_so') return 80;
+    if (item.table_name === 'chi_phi') return 90;
+    if (item.table_name === 'cai_dat') return 100;
+    return 999;
+  }
+
+  /**
    * Lọc payload chỉ gồm các cột hợp lệ trong migration CSDL Supabase
    */
   static sanitizePayload(tableName: OutboxTable, data: Record<string, unknown>): Record<string, unknown> {
-    const allowedColumns: Record<OutboxTable, string[]> = {
+    const allowedColumns: Partial<Record<OutboxTable, string[]>> = {
       toa_nha: [
         'id', 'owner_id', 'ten', 'dia_chi', 'don_gia_dien', 'phi_dich_vu_dau_nguoi',
         'ngay_chot_so', 'han_dong_tien', 'is_deleted', 'cach_tinh_nuoc', 'don_gia_nuoc',
@@ -145,7 +204,168 @@ export class SyncService {
   }
 
   /**
+   * Hoàn tác dữ liệu Dexie khi tạo nhóm hợp đồng + sinh viên bị lỗi vĩnh viễn
+   */
+  static async rollbackContractGroup(hopDong: HopDong, sinhViens: SinhVien[]): Promise<void> {
+    try {
+      await db.hop_dong.delete(hopDong.id);
+      for (const sv of sinhViens) {
+        await db.sinh_vien.delete(sv.id);
+      }
+      const phong = await db.phong.get(hopDong.phong_id);
+      if (phong) {
+        phong.trang_thai = 'trong';
+        await db.phong.put(phong);
+      }
+    } catch (err) {
+      console.error('Lỗi rollback contract group:', err);
+    }
+  }
+
+  /**
+   * Xử lý nhóm hợp đồng gồm 3 bước tuần tự:
+   * (a) upsert hop_dong với nguoi_dai_dien_id = null
+   * (b) upsert các sinh_vien của hợp đồng đó
+   * (c) update hop_dong.nguoi_dai_dien_id = id sinh viên đại diện
+   */
+  static async processContractGroupItem(
+    item: OutboxItem
+  ): Promise<'done' | 'step_advanced' | 'network_break'> {
+    const payload = item.payload as {
+      hopDong: HopDong;
+      sinhViens: SinhVien[];
+      step: 1 | 2 | 3;
+    };
+
+    const { hopDong, sinhViens } = payload;
+    let currentStep = payload.step || 1;
+
+    // BƯỚC 1: (a) upsert hop_dong với nguoi_dai_dien_id = null
+    if (currentStep === 1) {
+      const hdPayload = this.sanitizePayload('hop_dong', {
+        ...hopDong,
+        nguoi_dai_dien_id: null,
+      });
+      const { error: errStep1 } = await supabase.from('hop_dong').upsert(hdPayload);
+      if (errStep1) {
+        if (this.isNetworkError(errStep1)) return 'network_break';
+        await this.rollbackContractGroup(hopDong, sinhViens);
+        await db.outbox.delete(item.id);
+        throw new Error(this.formatSupabaseError(errStep1));
+      }
+      currentStep = 2;
+      payload.step = 2;
+      await db.outbox.update(item.id, { payload: { ...payload, step: 2 } });
+    }
+
+    // BƯỚC 2: (b) upsert các sinh_vien của hợp đồng đó
+    if (currentStep === 2) {
+      if (sinhViens && sinhViens.length > 0) {
+        const svPayloads = sinhViens.map((sv) =>
+          this.sanitizePayload('sinh_vien', sv as unknown as Record<string, unknown>)
+        );
+        const { error: errStep2 } = await supabase.from('sinh_vien').upsert(svPayloads);
+        if (errStep2) {
+          if (this.isNetworkError(errStep2)) return 'network_break';
+          await this.rollbackContractGroup(hopDong, sinhViens);
+          await db.outbox.delete(item.id);
+          throw new Error(this.formatSupabaseError(errStep2));
+        }
+      }
+      currentStep = 3;
+      payload.step = 3;
+      await db.outbox.update(item.id, { payload: { ...payload, step: 3 } });
+    }
+
+    // BƯỚC 3: (c) update hop_dong.nguoi_dai_dien_id = id sinh viên đại diện
+    if (currentStep === 3) {
+      const repId = hopDong.nguoi_dai_dien_id || sinhViens.find((s) => s.la_dai_dien)?.id;
+      if (repId) {
+        const { error: errStep3 } = await supabase
+          .from('hop_dong')
+          .update({
+            nguoi_dai_dien_id: repId,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', hopDong.id);
+        if (errStep3) {
+          if (this.isNetworkError(errStep3)) return 'network_break';
+          await this.rollbackContractGroup(hopDong, sinhViens);
+          await db.outbox.delete(item.id);
+          throw new Error(this.formatSupabaseError(errStep3));
+        }
+      }
+      return 'done';
+    }
+
+    return 'done';
+  }
+
+  /**
+   * Lưu Hợp đồng kèm Sinh viên theo đúng 3 bước tuần tự:
+   * Dexie: lưu đầy đủ ngay (optimistic)
+   * Supabase:
+   * (a) upsert hop_dong với nguoi_dai_dien_id = null
+   * (b) upsert các sinh_vien của hợp đồng đó
+   * (c) update hop_dong.nguoi_dai_dien_id = id sinh viên đại diện
+   */
+  static async saveHopDongWithStudents(hopDong: HopDong, sinhViens: SinhVien[]): Promise<void> {
+    const nowIso = new Date().toISOString();
+    hopDong.updated_at = nowIso;
+    for (const sv of sinhViens) {
+      sv.updated_at = nowIso;
+    }
+
+    // 1. Lưu ngay vào Dexie (Optimistic UI)
+    await db.hop_dong.put(hopDong);
+    if (sinhViens.length > 0) {
+      await db.sinh_vien.bulkPut(sinhViens);
+    }
+
+    if (!isSupabaseConfigured()) return;
+
+    // 2. Tạo bản ghi outbox nhóm
+    const outboxItem: OutboxItem = {
+      id: crypto.randomUUID(),
+      table_name: 'hop_dong_group',
+      action: 'upsert',
+      record_id: hopDong.id,
+      payload: {
+        hopDong,
+        sinhViens,
+        step: 1,
+      },
+      created_at: nowIso,
+      retry_count: 0,
+    };
+
+    // Đưa vào outbox
+    await db.outbox.put(outboxItem);
+    this.notifyListeners();
+
+    // Nếu ngoại tuyến, dừng lại chờ có mạng
+    if (!navigator.onLine) {
+      return;
+    }
+
+    // Nếu có mạng, thực thi tuần tự
+    try {
+      const result = await this.processContractGroupItem(outboxItem);
+      if (result === 'done') {
+        await db.outbox.delete(outboxItem.id);
+      }
+    } catch (err) {
+      throw err;
+    } finally {
+      this.notifyListeners();
+    }
+  }
+
+  /**
    * Xử lý gửi toàn bộ hàng đợi outbox lên Supabase khi có mạng
+   * Tuân thủ thứ tự toàn cục:
+   * toa_nha -> phong -> hop_dong -> sinh_vien -> update nguoi_dai_dien_id -> hoa_don -> thanh_toan -> chi_so -> chi_phi -> cai_dat
+   * Không đẩy song song các bảng có phụ thuộc.
    */
   static async processOutbox(): Promise<{ processed: number; remaining: number }> {
     if (!isSupabaseConfigured() || !navigator.onLine || this.isProcessingOutbox) {
@@ -157,20 +377,39 @@ export class SyncService {
     let processed = 0;
 
     try {
-      const items = await db.outbox.orderBy('created_at').toArray();
-      for (const item of items) {
+      const rawItems = await db.outbox.toArray();
+      // Sắp xếp theo thứ tự ưu tiên toàn cục và thời gian tạo
+      const sortedItems = rawItems.sort((a, b) => {
+        const pA = SyncService.getTablePriority(a);
+        const pB = SyncService.getTablePriority(b);
+        if (pA !== pB) return pA - pB;
+        return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+      });
+
+      for (const item of sortedItems) {
+        if (!navigator.onLine) break;
+
         try {
+          if (item.table_name === 'hop_dong_group') {
+            const groupResult = await this.processContractGroupItem(item);
+            if (groupResult === 'done') {
+              await db.outbox.delete(item.id);
+              processed++;
+            } else if (groupResult === 'network_break') {
+              break;
+            }
+            continue;
+          }
+
           if (item.action === 'upsert') {
             const sanitized = this.sanitizePayload(item.table_name, item.payload as Record<string, unknown>);
             const { error } = await supabase.from(item.table_name).upsert(sanitized);
             if (error) {
-              if (this.isNetworkError(error)) {
-                break; // Mất mạng, dừng lại chờ lần sau
-              }
+              if (this.isNetworkError(error)) break;
               console.error(`Lỗi đẩy outbox (${item.table_name}):`, error);
               await db.outbox.update(item.id, {
                 retry_count: (item.retry_count || 0) + 1,
-                last_error: error.message,
+                last_error: this.formatSupabaseError(error),
               });
               continue;
             }
@@ -181,7 +420,7 @@ export class SyncService {
               console.error(`Lỗi xóa outbox (${item.table_name}):`, error);
               await db.outbox.update(item.id, {
                 retry_count: (item.retry_count || 0) + 1,
-                last_error: error.message,
+                last_error: this.formatSupabaseError(error),
               });
               continue;
             }
@@ -194,7 +433,7 @@ export class SyncService {
           console.error('Lỗi khi gửi bản ghi outbox:', itemErr);
           await db.outbox.update(item.id, {
             retry_count: (item.retry_count || 0) + 1,
-            last_error: itemErr instanceof Error ? itemErr.message : String(itemErr),
+            last_error: this.formatSupabaseError(itemErr),
           });
         }
       }
@@ -253,6 +492,7 @@ export class SyncService {
 
   /**
    * Tải toàn bộ dữ liệu từ Supabase về Dexie (Hỗ trợ phân trang và delta sync)
+   * Tự động gán sinh viên có la_dai_dien = true nếu nguoi_dai_dien_id null
    */
   static async syncFromSupabase(ownerId: string): Promise<{ success: boolean; message: string }> {
     if (!isSupabaseConfigured()) {
@@ -276,11 +516,35 @@ export class SyncService {
 
       // 3. Hợp đồng
       const hopDongs = await this.fetchAllFromSupabase<HopDong>('hop_dong', ownerId, lastSync);
-      if (hopDongs.length > 0) await db.hop_dong.bulkPut(hopDongs);
 
       // 4. Sinh viên
       const sinhViens = await this.fetchAllFromSupabase<SinhVien>('sinh_vien', ownerId, lastSync);
       if (sinhViens.length > 0) await db.sinh_vien.bulkPut(sinhViens);
+
+      // Khi đọc từ Supabase về: nếu nguoi_dai_dien_id null thì tự gán sinh viên có la_dai_dien = true của hợp đồng đó
+      const repByHd = new Map<string, string>();
+      const allActiveSv = await db.sinh_vien.where({ dang_o: 1 as unknown as boolean }).toArray();
+      for (const sv of [...allActiveSv, ...sinhViens]) {
+        if (sv.la_dai_dien && sv.hop_dong_id) {
+          repByHd.set(sv.hop_dong_id, sv.id);
+        }
+      }
+
+      for (const hd of hopDongs) {
+        if (!hd.nguoi_dai_dien_id && repByHd.has(hd.id)) {
+          hd.nguoi_dai_dien_id = repByHd.get(hd.id);
+        }
+      }
+      if (hopDongs.length > 0) await db.hop_dong.bulkPut(hopDongs);
+
+      // Cập nhật các hợp đồng đã có sẵn trong Dexie nếu nguoi_dai_dien_id còn null
+      const existingHds = await db.hop_dong.toArray();
+      for (const hd of existingHds) {
+        if (!hd.nguoi_dai_dien_id && repByHd.has(hd.id)) {
+          hd.nguoi_dai_dien_id = repByHd.get(hd.id);
+          await db.hop_dong.put(hd);
+        }
+      }
 
       // 5. Chỉ số
       const chiSos = await this.fetchAllFromSupabase<ChiSo>('chi_so', ownerId, lastSync);
@@ -325,7 +589,7 @@ export class SyncService {
   }
 
   // =========================================================================
-  // CÁC THAO TÁC GHI DỮ LIỆU (OPTIMISTIC UI + ROLLBACK + OUTBOX)
+  // CÁC THAO TÁC GHI DỮ LIỆU ĐƠN LẺ
   // =========================================================================
 
   /**
@@ -350,10 +614,9 @@ export class SyncService {
         if (this.isNetworkError(error)) {
           await this.addToOutbox('toa_nha', 'upsert', toa.id, toa);
         } else {
-          // Hoàn tác Dexie nếu lỗi nghiệp vụ/CSDL
           if (previous) await db.toa_nha.put(previous);
           else await db.toa_nha.delete(toa.id);
-          throw new Error(`Lỗi lưu Tòa lên máy chủ: ${error.message}`);
+          throw new Error(this.formatSupabaseError(error));
         }
       }
     } catch (err) {
@@ -394,7 +657,7 @@ export class SyncService {
           await this.addToOutbox('toa_nha', 'upsert', toaId, updatedToa);
         } else {
           await db.toa_nha.put(previous);
-          throw new Error(`Lỗi xóa Tòa trên máy chủ: ${error.message}`);
+          throw new Error(this.formatSupabaseError(error));
         }
       }
     } catch (err) {
@@ -431,7 +694,7 @@ export class SyncService {
         } else {
           if (previous) await db.phong.put(previous);
           else await db.phong.delete(phong.id);
-          throw new Error(`Lỗi lưu phòng lên máy chủ: ${error.message}`);
+          throw new Error(this.formatSupabaseError(error));
         }
       }
     } catch (err) {
@@ -446,7 +709,7 @@ export class SyncService {
   }
 
   /**
-   * Lưu Sinh viên
+   * Lưu Sinh viên lẻ
    */
   static async saveSinhVien(sv: SinhVien): Promise<void> {
     const previous = await db.sinh_vien.get(sv.id);
@@ -469,7 +732,7 @@ export class SyncService {
         } else {
           if (previous) await db.sinh_vien.put(previous);
           else await db.sinh_vien.delete(sv.id);
-          throw new Error(`Lỗi lưu sinh viên lên máy chủ: ${error.message}`);
+          throw new Error(this.formatSupabaseError(error));
         }
       }
     } catch (err) {
@@ -510,7 +773,7 @@ export class SyncService {
           await this.addToOutbox('sinh_vien', 'upsert', svId, updated);
         } else {
           await db.sinh_vien.put(previous);
-          throw new Error(`Lỗi cập nhật sinh viên rời phòng: ${error.message}`);
+          throw new Error(this.formatSupabaseError(error));
         }
       }
     } catch (err) {
@@ -524,7 +787,7 @@ export class SyncService {
   }
 
   /**
-   * Lưu Hợp đồng
+   * Cập nhật thông tin Hợp đồng đơn lẻ (ví dụ: cập nhật đồ bàn giao, ghi chú)
    */
   static async saveHopDong(hd: HopDong): Promise<void> {
     const previous = await db.hop_dong.get(hd.id);
@@ -547,7 +810,7 @@ export class SyncService {
         } else {
           if (previous) await db.hop_dong.put(previous);
           else await db.hop_dong.delete(hd.id);
-          throw new Error(`Lỗi lưu hợp đồng lên máy chủ: ${error.message}`);
+          throw new Error(this.formatSupabaseError(error));
         }
       }
     } catch (err) {
@@ -642,7 +905,7 @@ export class SyncService {
         if (this.isNetworkError(error)) {
           for (const cs of chiSos) await this.addToOutbox('chi_so', 'upsert', cs.id, cs);
         } else {
-          throw new Error(`Lỗi đẩy chỉ số lên Supabase: ${error.message}`);
+          throw new Error(this.formatSupabaseError(error));
         }
       }
     } catch (err) {
@@ -676,7 +939,7 @@ export class SyncService {
         if (this.isNetworkError(error)) {
           for (const hd of hoaDons) await this.addToOutbox('hoa_don', 'upsert', hd.id, hd);
         } else {
-          throw new Error(`Lỗi đẩy hóa đơn lên Supabase: ${error.message}`);
+          throw new Error(this.formatSupabaseError(error));
         }
       }
     } catch (err) {
@@ -752,13 +1015,12 @@ export class SyncService {
         await this.addToOutbox('hoa_don', 'upsert', hoaDon.id, hoaDon);
         await this.addToOutbox('thanh_toan', 'upsert', paymentId, thanhToan);
       } else {
-        // Rollback
         hoaDon.da_dong = previousDaDong;
         hoaDon.con_no = Math.max(0, hoaDon.tong_tien - previousDaDong);
         hoaDon.trang_thai = previousTrangThai;
         await db.hoa_don.put(hoaDon);
         await db.thanh_toan.delete(paymentId);
-        throw new Error(`Lỗi cập nhật thanh toán lên máy chủ: ${err instanceof Error ? err.message : String(err)}`);
+        throw new Error(this.formatSupabaseError(err));
       }
     }
 
@@ -837,7 +1099,7 @@ export class SyncService {
         } else {
           if (previous) await db.chi_phi.put(previous);
           else await db.chi_phi.delete(chiPhi.id);
-          throw new Error(`Lỗi lưu chi phí lên máy chủ: ${error.message}`);
+          throw new Error(this.formatSupabaseError(error));
         }
       }
     } catch (err) {
@@ -872,7 +1134,7 @@ export class SyncService {
           await this.addToOutbox('chi_phi', 'delete', chiPhiId, {});
         } else {
           if (previous) await db.chi_phi.put(previous);
-          throw new Error(`Lỗi xóa chi phí trên máy chủ: ${error.message}`);
+          throw new Error(this.formatSupabaseError(error));
         }
       }
     } catch (err) {
@@ -909,7 +1171,7 @@ export class SyncService {
         } else {
           if (previous) await db.cai_dat.put(previous);
           else await db.cai_dat.delete(caiDat.owner_id);
-          throw new Error(`Lỗi lưu cài đặt lên máy chủ: ${error.message}`);
+          throw new Error(this.formatSupabaseError(error));
         }
       }
     } catch (err) {
